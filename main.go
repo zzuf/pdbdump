@@ -1,136 +1,27 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
+	"io"
+	"log"
+	"math/bits"
+	"net/http"
 	"os"
+	"syscall"
 	"unsafe"
 
+	"github.com/saferwall/pe"
 	"golang.org/x/sys/windows"
 )
 
 const (
-	INVALID_HANDLE_VALUE = windows.Handle(0xFFFFFFFF)
+	INVALID_HANDLE_VALUE         = windows.Handle(0xFFFFFFFF)
+	IMAGE_DIRECTORY_ENTRY_EXPORT = 0
+	IMAGE_DIRECTORY_ENTRY_DEBUG  = 6
+	IMAGE_DEBUG_TYPE_CODEVIEW    = 2
+	CP_UTF8                      = uint32(65001)
+	MAXDWORD                     = uint32(0xffffffff)
 )
-
-//winnt.h
-type ImageDOSHeader struct {
-	Magic                    uint16
-	BytesOnLastPageOfFile    uint16
-	PagesInFile              uint16
-	Relocations              uint16
-	SizeOfHeader             uint16
-	MinExtraParagraphsNeeded uint16
-	MaxExtraParagraphsNeeded uint16
-	InitialSS                uint16
-	InitialSP                uint16
-	Checksum                 uint16
-	InitialIP                uint16
-	InitialCS                uint16
-	AddressOfRelocationTable uint16
-	OverlayNumber            uint16
-	ReservedWords1           [4]uint16
-	OEMIdentifier            uint16
-	OEMInformation           uint16
-	ReservedWords2           [10]uint16
-	AddressOfNewEXEHeader    uint32
-}
-
-type ImageNtHeader struct {
-	Signature      uint32
-	FileHeader     ImageFileHeader
-	OptionalHeader *ImageOptionalHeader
-}
-
-type ImageFileHeader struct {
-	Machine              uint16
-	NumberOfSections     uint16
-	TimeDateStamp        uint32
-	PointerToSymbolTable uint32
-	NumberOfSymbols      uint32
-	SizeOfOptionalHeader uint16
-	Characteristics      uint16
-}
-
-//x64
-type ImageOptionalHeader struct {
-	Magic                       uint16
-	MajorLinkerVersion          uint8
-	MinorLinkerVersion          uint8
-	SizeOfCode                  uint32
-	SizeOfInitializedData       uint32
-	SizeOfUninitializedData     uint32
-	AddressOfEntryPoint         uint32
-	BaseOfCode                  uint32
-	ImageBase                   uint64
-	SectionAlignment            uint32
-	FileAlignment               uint32
-	MajorOperatingSystemVersion uint16
-	MinorOperatingSystemVersion uint16
-	MajorImageVersion           uint16
-	MinorImageVersion           uint16
-	MajorSubsystemVersion       uint16
-	MinorSubsystemVersion       uint16
-	Win32VersionValue           uint32
-	SizeOfImage                 uint32
-	SizeOfHeaders               uint32
-	CheckSum                    uint32
-	Subsystem                   uint16
-	DllCharacteristics          uint16
-	SizeOfStackReserve          uint64
-	SizeOfStackCommit           uint64
-	SizeOfHeapReserve           uint64
-	SizeOfHeapCommit            uint64
-	LoaderFlags                 uint32
-	NumberOfRvaAndSizes         uint32
-	DataDirectory               [16]ImageDataDirectory
-}
-
-type ImageDataDirectory struct {
-	VirtualAddress uint32
-	Size           uint32
-}
-
-type ImageSectionHeader struct {
-	Name                 [8]uint8
-	VirtualSize          uint32
-	VirtualAddress       uint32
-	SizeOfRawData        uint32
-	PointerToRawData     uint32
-	PointerToRelocations uint32
-	PointerToLineNumbers uint32
-	NumberOfRelocations  uint16
-	NumberOfLineNumbers  uint16
-	Characteristics      uint32
-}
-
-type ImageExportDirectory struct {
-	Characteristics       uint32
-	TimeDateStamp         uint32
-	MajorVersion          uint16
-	MinorVersion          uint16
-	Name                  uint32
-	Base                  uint32
-	NumberOfFunctions     uint32
-	NumberOfNames         uint32
-	AddressOfFunctions    uint32
-	AddressOfNames        uint32
-	AddressOfNameOrdinals uint32
-}
-
-type ImageDebugDirectoryType uint32
-
-type ImageDebugDirectory struct {
-	Characteristics  uint32
-	TimeDateStamp    uint32
-	MajorVersion     uint16
-	MinorVersion     uint16
-	Type             ImageDebugDirectoryType
-	SizeOfData       uint32
-	AddressOfRawData uint32
-	PointerToRawData uint32
-}
 
 type PERelocation struct {
 	RVA  uint32
@@ -149,95 +40,183 @@ type PE struct {
 	IsInAnotherAddressSpace bool
 	HProcess                windows.Handle
 	BaseAddress             uint64
-	DosHeader               *ImageDOSHeader
-	NtHeader                *ImageNtHeader
-	OptHeader               *ImageOptionalHeader
-	DataDir                 *ImageDataDirectory
-	SectionHeaders          *ImageSectionHeader
-	ExportDirectory         *ImageExportDirectory
+	DosHeader               *pe.ImageDOSHeader
+	NtHeader                *pe.ImageNtHeader
+	OptHeader               interface{}
+	DataDir                 [16]pe.DataDirectory
+	SectionHeaders          []pe.Section
+	ExportDirectory         *pe.ImageExportDirectory
 	ExportedNames           *uint32
 	ExportedNamesLength     uint32
 	ExportedFunctions       *uint32
 	ExportedOrdinals        *uint16
 	NbRelocations           uint32
 	Relocations             *PERelocation
-	DebugDirectory          *ImageDebugDirectory
+	DebugDirectory          *pe.ImageDebugDirectory
 	CodeviewDebugInfo       *PECodeDebugInfo
 }
 
-func readFullFile(filePath string) []byte {
-	bytes, err := os.ReadFile(filePath)
+type PDBSymbol struct {
+	PDBName        string
+	PDBBaseAddress uint64
+	SymHandle      windows.Handle
+}
+
+func fileExists(filePath string) bool {
+	_, err := os.Stat(filePath)
+	return err == nil
+}
+
+func downloadFullFile(filepath string, url string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	out, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+func downloadPDB(guid windows.GUID, age uint32, fileName string) bool {
+	var guid4 [8]byte
+	for i := 0; i < 8; i++ {
+		guid4[i] = bits.RotateLeft8(guid.Data4[8-i], 4)
+	}
+	pdbURI := fmt.Sprintf("/download/symbols/%s/%08X%04X%04X%016X%X/%s", fileName, guid.Data1, guid.Data2, guid.Data3, guid4, age, fileName)
+	err := downloadFullFile(fileName, "https://msdl.microsoft.com"+pdbURI)
+	if err != nil {
+		return true
+	} else {
+		return false
+	}
+}
+
+func downloadPDBFromPE(tmppe *PE, fileName string) bool {
+	guid := tmppe.CodeviewDebugInfo.Guid
+	age := tmppe.CodeviewDebugInfo.Age
+	return downloadPDB(guid, age, fileName)
+}
+
+func loadSymbolsFromPE(tmppe *PE) {
+	psbSymbol := &PDBSymbol{}
+	pdbName := byte(tmppe.CodeviewDebugInfo.PdbName[0])
+	sizeNeeded, err := windows.MultiByteToWideChar(CP_UTF8, 0, &pdbName, -1, nil, 0)
 	if err != nil {
 		panic(err)
 	}
-	return bytes
+	pdbNameTmp := make([]uint16, sizeNeeded)
+	_, err = windows.MultiByteToWideChar(CP_UTF8, 0, &pdbName, -1, &pdbNameTmp[0], sizeNeeded)
+	if err != nil {
+		panic(err)
+	}
+	psbSymbol.PDBName = syscall.UTF16ToString(pdbNameTmp)
+	if !fileExists(psbSymbol.PDBName) {
+		downloadPDBFromPE(tmppe, psbSymbol.PDBName)
+	}
+	askedPdbBaseAddr := uint64(0x1337000)
+	pdbImageSize := MAXDWORD
+	cp, err := windows.GetCurrentProcess()
+	if err != nil {
+		panic(err)
+	}
+
 }
 
 func loadSymbolsFromImageFile(imageFilePath string) {
-	image := readFullFile(imageFilePath)
-	fmt.Println(image)
+	// image := readFullFile(imageFilePath)
+	pe, err := pe.New(imageFilePath, &pe.Options{})
+	if err != nil {
+		log.Fatalf("Error while opening file: %s, reason: %v", imageFilePath, err)
+	}
+
+	err = pe.Parse()
+	if err != nil {
+		log.Fatalf("Error while parsing file: %s, reason: %v", imageFilePath, err)
+	}
+	peCreate(pe, false)
+	// fmt.Println(image)
 
 }
 
-func parseDosHeader(imageBytes []byte) *ImageDOSHeader {
-	var imageDosHeader ImageDOSHeader
-	offset := uint32(0)
-	size := uint32(unsafe.Sizeof(imageDosHeader))
-	totalSize := offset + size
-	buf := bytes.NewReader(imageBytes[offset:totalSize])
-	err := binary.Read(buf, binary.LittleEndian, &imageDosHeader)
-	if err != nil {
-		panic(err)
+func peSectionHeaderfromRVA(tmppe *PE, rva uint32) *pe.Section {
+	sectionHeaders := tmppe.SectionHeaders
+	for _, sectionHeader := range sectionHeaders {
+		currSectionVA := sectionHeader.Header.VirtualAddress
+		currSectionVSize := sectionHeader.Header.VirtualSize
+		if currSectionVA <= rva && rva < (currSectionVA+currSectionVSize) {
+			return &sectionHeader
+		}
 	}
-	return &imageDosHeader
+	return nil
 }
 
-func parseNTHeader(imageBytes []byte, ntHeaderOffset uint32) *ImageNtHeader {
-	var imageNtHeader ImageNtHeader
-	sig := binary.LittleEndian.Uint32(imageBytes[ntHeaderOffset:])
-	imageNtHeader.Signature = sig
-	fileHeaderSize := uint32(binary.Size(imageNtHeader.FileHeader))
-	fileHeaderOffset := ntHeaderOffset + 4
-	totalSize := fileHeaderOffset + fileHeaderSize
-	buf := bytes.NewReader(imageBytes[fileHeaderOffset:totalSize])
-	err := binary.Read(buf, binary.LittleEndian, &imageNtHeader.FileHeader)
-	if err != nil {
-		panic(err)
+func peRVAtoAddr(tmppe *PE, rva uint32) uintptr {
+	peBase := tmppe.DosHeader
+	if tmppe.IsMemoryMapped {
+		return uintptr(unsafe.Pointer(peBase)) + uintptr(rva)
 	}
-	optHeader := ImageOptionalHeader{}
-	optHeaderOffset := ntHeaderOffset + (fileHeaderSize + 4)
-	magic := binary.LittleEndian.Uint16(imageBytes[optHeaderOffset:])
-	if magic != 0x20b {
-		panic("Only x64")
-	}
-	size := uint32(binary.Size(optHeader))
-	buf = bytes.NewReader(imageBytes[optHeaderOffset : optHeaderOffset+size])
-	err = binary.Read(buf, binary.LittleEndian, &optHeader)
-	if err != nil {
-		panic(err)
-	}
-	imageNtHeader.OptionalHeader = &optHeader
-
-	return &imageNtHeader
-}
-
-func peCreate(imageBytes []byte, isMemoryMapped bool) {
-	var pe *PE
-	pe.IsMemoryMapped = isMemoryMapped
-	pe.IsInAnotherAddressSpace = false
-	pe.HProcess = INVALID_HANDLE_VALUE
-	pe.DosHeader = parseDosHeader(imageBytes)
-	pe.NtHeader = parseNTHeader(imageBytes, pe.DosHeader.AddressOfNewEXEHeader)
-	pe.OptHeader = pe.NtHeader.OptionalHeader
-	if isMemoryMapped {
-		pe.BaseAddress = uint64(uintptr(unsafe.Pointer(&imageBytes[0])))
+	rvaSectionHeader := peSectionHeaderfromRVA(tmppe, rva)
+	if rvaSectionHeader != nil {
+		return uintptr(unsafe.Pointer(peBase)) + uintptr(rvaSectionHeader.Header.PointerToRawData) + uintptr(rva-rvaSectionHeader.Header.VirtualAddress)
 	} else {
-		pe.BaseAddress = pe.NtHeader.OptionalHeader.ImageBase
+		panic("return 0")
+		return 0
 	}
-	pe.DataDir = &pe.OptHeader.DataDirectory[0]
-	// pe.SectionHeaders =
-	// a := unsafe.Pointer(&pe)
-	// fmt.Println(a)
+}
+
+func peCreate(pefile *pe.File, isMemoryMapped bool) {
+	var tmppe *PE
+	tmppe.IsMemoryMapped = isMemoryMapped
+	tmppe.IsInAnotherAddressSpace = false
+	tmppe.HProcess = INVALID_HANDLE_VALUE
+	tmppe.DosHeader = &pefile.DOSHeader
+	tmppe.NtHeader = &pefile.NtHeader
+	tmppe.OptHeader = &pefile.NtHeader.OptionalHeader
+	switch tmppe.OptHeader.(type) {
+	case pe.ImageOptionalHeader32:
+		tmppe.BaseAddress = uint64(pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader32).ImageBase)
+		tmppe.DataDir = pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader32).DataDirectory //(*pe.ImageDataDirectory)(unsafe.Pointer(pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader32).DataDirectory))
+	case pe.ImageOptionalHeader64:
+		tmppe.BaseAddress = uint64(pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader64).ImageBase)
+		tmppe.DataDir = pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader64).DataDirectory
+	}
+	tmppe.SectionHeaders = pefile.Sections
+	exportRVA := tmppe.DataDir[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress
+	if exportRVA == 0 {
+		tmppe.ExportDirectory = nil
+		tmppe.ExportedNames = nil
+		tmppe.ExportedFunctions = nil
+		tmppe.ExportedOrdinals = nil
+	} else {
+		tmppe.ExportDirectory = (*pe.ImageExportDirectory)(unsafe.Pointer(peRVAtoAddr(tmppe, exportRVA)))
+		tmppe.ExportedNames = (*uint32)(unsafe.Pointer(peRVAtoAddr(tmppe, tmppe.ExportDirectory.AddressOfNames)))
+		tmppe.ExportedFunctions = (*uint32)(unsafe.Pointer(peRVAtoAddr(tmppe, tmppe.ExportDirectory.AddressOfFunctions)))
+		tmppe.ExportedOrdinals = (*uint16)(unsafe.Pointer(peRVAtoAddr(tmppe, tmppe.ExportDirectory.AddressOfNames)))
+		tmppe.ExportedNamesLength = tmppe.ExportDirectory.NumberOfNames
+	}
+	tmppe.Relocations = nil
+	debugRVA := tmppe.DataDir[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress
+	if debugRVA == 0 {
+		tmppe.DebugDirectory = nil
+	} else {
+		tmppe.DebugDirectory = (*pe.ImageDebugDirectory)(unsafe.Pointer(peRVAtoAddr(tmppe, debugRVA)))
+		if tmppe.DebugDirectory.Type != IMAGE_DEBUG_TYPE_CODEVIEW {
+			tmppe.DebugDirectory = nil
+		} else {
+			tmppe.CodeviewDebugInfo = (*PECodeDebugInfo)(unsafe.Pointer(peRVAtoAddr(tmppe, tmppe.DebugDirectory.AddressOfRawData)))
+			if tmppe.CodeviewDebugInfo.Signature != 1111 {
+				tmppe.DebugDirectory = nil
+				tmppe.CodeviewDebugInfo = nil
+			}
+		}
+	}
 }
 func main() {
 	_, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
