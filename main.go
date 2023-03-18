@@ -1,6 +1,9 @@
 package main
 
+//go:generate go run golang.org/x/sys/windows/mkwinsyscall -output syscallwin.go main.go
+
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +17,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+//sys SymInitialize(hProcess windows.Handle, UserSearchPath unsafe.Pointer, fInvadeProcess bool) (ret bool) = Dbghelp.SymInitialize
+//sys SymLoadModuleExW(hProcess unsafe.Pointer, hFile unsafe.Pointer, ImageName *uint16, ModuleName *uint16, BaseOfDll uint64, DllSize uint32, Data *MODLOAD_DATA, Flags uint32) (ret uint64) = Dbghelp.SymLoadModuleExW
+//sys SymUnloadModule64(hProcess unsafe.Pointer, BaseOfDll uint64) (ret bool) = Dbghelp.SymUnloadModule64
+//sys SymCleanup(hProcess windows.Handle) (ret bool) = Dbghelp.SymCleanup
+//sys SymGetTypeFromNameW(hProcess unsafe.Pointer, BaseOfDll uint64, Name *uint16, Symbol *SYMBOL_INFO) (ret bool) = Dbghelp.SymGetTypeFromNameW
+
 const (
 	INVALID_HANDLE_VALUE         = windows.Handle(0xFFFFFFFF)
 	IMAGE_DIRECTORY_ENTRY_EXPORT = 0
@@ -21,7 +30,39 @@ const (
 	IMAGE_DEBUG_TYPE_CODEVIEW    = 2
 	CP_UTF8                      = uint32(65001)
 	MAXDWORD                     = uint32(0xffffffff)
+	MAX_SYM_NAME                 = 2000
 )
+
+type MODLOAD_DATA struct {
+	ssize uint32
+	ssig  uint32
+	data  unsafe.Pointer
+	size  uint32
+	flags uint32
+}
+
+type SYMBOL_INFO_PACKAGE struct {
+	si   SYMBOL_INFO
+	name [MAX_SYM_NAME + 1]int8
+}
+
+type SYMBOL_INFO struct {
+	SizeOfStruct uint32
+	TypeIndex    uint32
+	Reserved     [2]uint64
+	Index        uint32
+	Size         uint32
+	ModBase      uint64
+	Flags        uint32
+	Value        uint64
+	Address      uint64
+	Register     uint32
+	Scope        uint32
+	Tag          uint32
+	NameLen      uint32
+	MaxNameLen   uint32
+	Name         [1]uint16
+}
 
 type PERelocation struct {
 	RVA  uint32
@@ -32,7 +73,7 @@ type PECodeDebugInfo struct {
 	Signature uint32
 	Guid      windows.GUID
 	Age       uint32
-	PdbName   [1]uint8
+	PdbName   [1]int8
 }
 
 type PE struct {
@@ -104,7 +145,7 @@ func downloadPDBFromPE(tmppe *PE, fileName string) bool {
 	return downloadPDB(guid, age, fileName)
 }
 
-func loadSymbolsFromPE(tmppe *PE) {
+func loadSymbolsFromPE(tmppe *PE) *PDBSymbol {
 	psbSymbol := &PDBSymbol{}
 	pdbName := byte(tmppe.CodeviewDebugInfo.PdbName[0])
 	sizeNeeded, err := windows.MultiByteToWideChar(CP_UTF8, 0, &pdbName, -1, nil, 0)
@@ -117,6 +158,7 @@ func loadSymbolsFromPE(tmppe *PE) {
 		panic(err)
 	}
 	psbSymbol.PDBName = syscall.UTF16ToString(pdbNameTmp)
+	pdbName16ptr := syscall.StringToUTF16Ptr(psbSymbol.PDBName)
 	if !fileExists(psbSymbol.PDBName) {
 		downloadPDBFromPE(tmppe, psbSymbol.PDBName)
 	}
@@ -126,11 +168,26 @@ func loadSymbolsFromPE(tmppe *PE) {
 	if err != nil {
 		panic(err)
 	}
-
+	pdbBaseAddr := SymLoadModuleExW(unsafe.Pointer(cp), nil, pdbName16ptr, nil, askedPdbBaseAddr, pdbImageSize, nil, 0)
+	for pdbBaseAddr == 0 {
+		lastErr := windows.GetLastError()
+		if lastErr == windows.ERROR_SUCCESS {
+			break
+		}
+		if lastErr == windows.ERROR_FILE_NOT_FOUND {
+			fmt.Println("PDB file not found!")
+			SymUnloadModule64(unsafe.Pointer(cp), askedPdbBaseAddr)
+			SymCleanup(cp)
+		}
+		fmt.Printf("SymLoadModuleExW error : %d(%s)\n", windows.GetLastError(), windows.GetLastError().Error())
+		askedPdbBaseAddr += 0x1000000
+		pdbBaseAddr = SymLoadModuleExW(unsafe.Pointer(cp), nil, pdbName16ptr, nil, askedPdbBaseAddr, pdbImageSize, nil, 0)
+	}
+	psbSymbol.PDBBaseAddress = pdbBaseAddr
+	return psbSymbol
 }
 
-func loadSymbolsFromImageFile(imageFilePath string) {
-	// image := readFullFile(imageFilePath)
+func loadSymbolsFromImageFile(imageFilePath string) *PDBSymbol {
 	pe, err := pe.New(imageFilePath, &pe.Options{})
 	if err != nil {
 		log.Fatalf("Error while opening file: %s, reason: %v", imageFilePath, err)
@@ -140,9 +197,9 @@ func loadSymbolsFromImageFile(imageFilePath string) {
 	if err != nil {
 		log.Fatalf("Error while parsing file: %s, reason: %v", imageFilePath, err)
 	}
-	peCreate(pe, false)
-	// fmt.Println(image)
-
+	tmppe := peCreate(pe, false)
+	pdbSymbols := loadSymbolsFromPE(tmppe)
+	return pdbSymbols
 }
 
 func peSectionHeaderfromRVA(tmppe *PE, rva uint32) *pe.Section {
@@ -167,12 +224,11 @@ func peRVAtoAddr(tmppe *PE, rva uint32) uintptr {
 		return uintptr(unsafe.Pointer(peBase)) + uintptr(rvaSectionHeader.Header.PointerToRawData) + uintptr(rva-rvaSectionHeader.Header.VirtualAddress)
 	} else {
 		panic("return 0")
-		return 0
 	}
 }
 
-func peCreate(pefile *pe.File, isMemoryMapped bool) {
-	var tmppe *PE
+func peCreate(pefile *pe.File, isMemoryMapped bool) *PE {
+	tmppe := &PE{}
 	tmppe.IsMemoryMapped = isMemoryMapped
 	tmppe.IsInAnotherAddressSpace = false
 	tmppe.HProcess = INVALID_HANDLE_VALUE
@@ -217,13 +273,36 @@ func peCreate(pefile *pe.File, isMemoryMapped bool) {
 			}
 		}
 	}
+	return tmppe
 }
-func main() {
-	_, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil {
-		panic(err)
-	}
 
+func getSymbolOffset(symbol *PDBSymbol, symbolName string) uint64 {
+	si := &SYMBOL_INFO_PACKAGE{}
+	si.si.SizeOfStruct = uint32(binary.Size(SYMBOL_INFO{}))
+	si.si.MaxNameLen = uint32(binary.Size(si.name))
+	symbolName16ptr := syscall.StringToUTF16Ptr(symbolName)
+	res := SymGetTypeFromNameW(unsafe.Pointer(symbol.SymHandle), symbol.PDBBaseAddress, symbolName16ptr, &si.si)
+	if res {
+		return si.si.Address - symbol.PDBBaseAddress
+	} else {
+		return 0
+	}
+}
+
+func test() {
+	symbol := loadSymbolsFromImageFile("C:\\windows\\system32\\ntoskrnl.exe")
+	if symbol == nil {
+		panic("test err")
+	}
+	fmt.Println(getSymbolOffset(symbol, "PspCreateProcessNotifyRoutine"))
+}
+
+func main() {
+	// _, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	test()
 }
 
 // func init_pdb7_root_stream(fName string, root_page_list []uint32, numRootPages uint32, rootSize uint32, pageSize uint32) {
