@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/bits"
 	"net/http"
 	"os"
 	"syscall"
@@ -22,6 +21,7 @@ import (
 //sys SymUnloadModule64(hProcess unsafe.Pointer, BaseOfDll uint64) (ret bool) = Dbghelp.SymUnloadModule64
 //sys SymCleanup(hProcess windows.Handle) (ret bool) = Dbghelp.SymCleanup
 //sys SymGetTypeFromNameW(hProcess unsafe.Pointer, BaseOfDll uint64, Name *uint16, Symbol *SYMBOL_INFO) (ret bool) = Dbghelp.SymGetTypeFromNameW
+//sys SymGetTypeInfo(hProcess unsafe.Pointer, ModBase uint64, TypeId uint32, GetType int32, pInfo unsafe.Pointer) (ret bool) = Dbghelp.SymGetTypeInfo
 
 const (
 	INVALID_HANDLE_VALUE         = windows.Handle(0xFFFFFFFF)
@@ -32,6 +32,12 @@ const (
 	MAXDWORD                     = uint32(0xffffffff)
 	MAX_SYM_NAME                 = 2000
 )
+
+type TI_FINDCHILDREN_PARAMS struct {
+	Count   uint32
+	Start   uint32
+	ChildId [1]uint32
+}
 
 type MODLOAD_DATA struct {
 	ssize uint32
@@ -63,40 +69,6 @@ type SYMBOL_INFO struct {
 	MaxNameLen   uint32
 	Name         [1]uint16
 }
-
-type PERelocation struct {
-	RVA  uint32
-	Type uint16
-}
-
-type PECodeDebugInfo struct {
-	Signature uint32
-	Guid      windows.GUID
-	Age       uint32
-	PdbName   [1]int8
-}
-
-type PE struct {
-	IsMemoryMapped          bool
-	IsInAnotherAddressSpace bool
-	HProcess                windows.Handle
-	BaseAddress             uint64
-	DosHeader               *pe.ImageDOSHeader
-	NtHeader                *pe.ImageNtHeader
-	OptHeader               interface{}
-	DataDir                 [16]pe.DataDirectory
-	SectionHeaders          []pe.Section
-	ExportDirectory         *pe.ImageExportDirectory
-	ExportedNames           *uint32
-	ExportedNamesLength     uint32
-	ExportedFunctions       *uint32
-	ExportedOrdinals        *uint16
-	NbRelocations           uint32
-	Relocations             *PERelocation
-	DebugDirectory          *pe.ImageDebugDirectory
-	CodeviewDebugInfo       *PECodeDebugInfo
-}
-
 type PDBSymbol struct {
 	PDBName        string
 	PDBBaseAddress uint64
@@ -109,6 +81,7 @@ func fileExists(filePath string) bool {
 }
 
 func downloadFullFile(filepath string, url string) error {
+	fmt.Println(url)
 	resp, err := http.Get(url)
 	if err != nil {
 		return err
@@ -126,10 +99,12 @@ func downloadFullFile(filepath string, url string) error {
 }
 
 func downloadPDB(guid windows.GUID, age uint32, fileName string) bool {
-	var guid4 [8]byte
-	for i := 0; i < 8; i++ {
-		guid4[i] = bits.RotateLeft8(guid.Data4[8-i], 4)
-	}
+	//var guid4 [8]byte
+	// for i := 0; i < 8; i++ {
+	// 	guid4[i] = guid.Data4[7-i] //bits.RotateLeft8(guid.Data4[7-i], 4)
+	// }
+	//byte rotate
+	guid4 := binary.BigEndian.Uint64(guid.Data4[:])
 	pdbURI := fmt.Sprintf("/download/symbols/%s/%08X%04X%04X%016X%X/%s", fileName, guid.Data1, guid.Data2, guid.Data3, guid4, age, fileName)
 	err := downloadFullFile(fileName, "https://msdl.microsoft.com"+pdbURI)
 	if err != nil {
@@ -139,28 +114,24 @@ func downloadPDB(guid windows.GUID, age uint32, fileName string) bool {
 	}
 }
 
-func downloadPDBFromPE(tmppe *PE, fileName string) bool {
-	guid := tmppe.CodeviewDebugInfo.Guid
-	age := tmppe.CodeviewDebugInfo.Age
-	return downloadPDB(guid, age, fileName)
-}
-
-func loadSymbolsFromPE(tmppe *PE) *PDBSymbol {
+func loadSymbolsFromPE(pefile *pe.File) *PDBSymbol {
 	psbSymbol := &PDBSymbol{}
-	pdbName := byte(tmppe.CodeviewDebugInfo.PdbName[0])
-	sizeNeeded, err := windows.MultiByteToWideChar(CP_UTF8, 0, &pdbName, -1, nil, 0)
-	if err != nil {
-		panic(err)
+	var pdbName string
+	var age uint32
+	var guid pe.GUID
+	switch pefile.Debugs[0].Info.(type) {
+	case pe.CVInfoPDB70:
+		pdb := pefile.Debugs[0].Info.(pe.CVInfoPDB70)
+		pdbName = pdb.PDBFileName
+		age = pdb.Age
+		guid = pdb.Signature
+	case pe.CVInfoPDB20:
+		break
 	}
-	pdbNameTmp := make([]uint16, sizeNeeded)
-	_, err = windows.MultiByteToWideChar(CP_UTF8, 0, &pdbName, -1, &pdbNameTmp[0], sizeNeeded)
-	if err != nil {
-		panic(err)
-	}
-	psbSymbol.PDBName = syscall.UTF16ToString(pdbNameTmp)
-	pdbName16ptr := syscall.StringToUTF16Ptr(psbSymbol.PDBName)
-	if !fileExists(psbSymbol.PDBName) {
-		downloadPDBFromPE(tmppe, psbSymbol.PDBName)
+	psbSymbol.PDBName = pdbName
+	pdbName16ptr := syscall.StringToUTF16Ptr(pdbName)
+	if !fileExists(pdbName) {
+		downloadPDB(windows.GUID(guid), age, pdbName)
 	}
 	askedPdbBaseAddr := uint64(0x1337000)
 	pdbImageSize := MAXDWORD
@@ -168,9 +139,16 @@ func loadSymbolsFromPE(tmppe *PE) *PDBSymbol {
 	if err != nil {
 		panic(err)
 	}
+	psbSymbol.SymHandle = cp
+	if !SymInitialize(cp, nil, false) {
+		return nil
+	}
 	pdbBaseAddr := SymLoadModuleExW(unsafe.Pointer(cp), nil, pdbName16ptr, nil, askedPdbBaseAddr, pdbImageSize, nil, 0)
 	for pdbBaseAddr == 0 {
 		lastErr := windows.GetLastError()
+		if lastErr == nil {
+			fmt.Println("erro nil")
+		}
 		if lastErr == windows.ERROR_SUCCESS {
 			break
 		}
@@ -179,7 +157,7 @@ func loadSymbolsFromPE(tmppe *PE) *PDBSymbol {
 			SymUnloadModule64(unsafe.Pointer(cp), askedPdbBaseAddr)
 			SymCleanup(cp)
 		}
-		fmt.Printf("SymLoadModuleExW error : %d(%s)\n", windows.GetLastError(), windows.GetLastError().Error())
+		fmt.Printf("SymLoadModuleExW error : %d(%s)\n", lastErr, lastErr.Error())
 		askedPdbBaseAddr += 0x1000000
 		pdbBaseAddr = SymLoadModuleExW(unsafe.Pointer(cp), nil, pdbName16ptr, nil, askedPdbBaseAddr, pdbImageSize, nil, 0)
 	}
@@ -197,83 +175,8 @@ func loadSymbolsFromImageFile(imageFilePath string) *PDBSymbol {
 	if err != nil {
 		log.Fatalf("Error while parsing file: %s, reason: %v", imageFilePath, err)
 	}
-	tmppe := peCreate(pe, false)
-	pdbSymbols := loadSymbolsFromPE(tmppe)
+	pdbSymbols := loadSymbolsFromPE(pe)
 	return pdbSymbols
-}
-
-func peSectionHeaderfromRVA(tmppe *PE, rva uint32) *pe.Section {
-	sectionHeaders := tmppe.SectionHeaders
-	for _, sectionHeader := range sectionHeaders {
-		currSectionVA := sectionHeader.Header.VirtualAddress
-		currSectionVSize := sectionHeader.Header.VirtualSize
-		if currSectionVA <= rva && rva < (currSectionVA+currSectionVSize) {
-			return &sectionHeader
-		}
-	}
-	return nil
-}
-
-func peRVAtoAddr(tmppe *PE, rva uint32) uintptr {
-	peBase := tmppe.DosHeader
-	if tmppe.IsMemoryMapped {
-		return uintptr(unsafe.Pointer(peBase)) + uintptr(rva)
-	}
-	rvaSectionHeader := peSectionHeaderfromRVA(tmppe, rva)
-	if rvaSectionHeader != nil {
-		return uintptr(unsafe.Pointer(peBase)) + uintptr(rvaSectionHeader.Header.PointerToRawData) + uintptr(rva-rvaSectionHeader.Header.VirtualAddress)
-	} else {
-		panic("return 0")
-	}
-}
-
-func peCreate(pefile *pe.File, isMemoryMapped bool) *PE {
-	tmppe := &PE{}
-	tmppe.IsMemoryMapped = isMemoryMapped
-	tmppe.IsInAnotherAddressSpace = false
-	tmppe.HProcess = INVALID_HANDLE_VALUE
-	tmppe.DosHeader = &pefile.DOSHeader
-	tmppe.NtHeader = &pefile.NtHeader
-	tmppe.OptHeader = &pefile.NtHeader.OptionalHeader
-	switch tmppe.OptHeader.(type) {
-	case pe.ImageOptionalHeader32:
-		tmppe.BaseAddress = uint64(pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader32).ImageBase)
-		tmppe.DataDir = pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader32).DataDirectory //(*pe.ImageDataDirectory)(unsafe.Pointer(pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader32).DataDirectory))
-	case pe.ImageOptionalHeader64:
-		tmppe.BaseAddress = uint64(pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader64).ImageBase)
-		tmppe.DataDir = pefile.NtHeader.OptionalHeader.(pe.ImageOptionalHeader64).DataDirectory
-	}
-	tmppe.SectionHeaders = pefile.Sections
-	exportRVA := tmppe.DataDir[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress
-	if exportRVA == 0 {
-		tmppe.ExportDirectory = nil
-		tmppe.ExportedNames = nil
-		tmppe.ExportedFunctions = nil
-		tmppe.ExportedOrdinals = nil
-	} else {
-		tmppe.ExportDirectory = (*pe.ImageExportDirectory)(unsafe.Pointer(peRVAtoAddr(tmppe, exportRVA)))
-		tmppe.ExportedNames = (*uint32)(unsafe.Pointer(peRVAtoAddr(tmppe, tmppe.ExportDirectory.AddressOfNames)))
-		tmppe.ExportedFunctions = (*uint32)(unsafe.Pointer(peRVAtoAddr(tmppe, tmppe.ExportDirectory.AddressOfFunctions)))
-		tmppe.ExportedOrdinals = (*uint16)(unsafe.Pointer(peRVAtoAddr(tmppe, tmppe.ExportDirectory.AddressOfNames)))
-		tmppe.ExportedNamesLength = tmppe.ExportDirectory.NumberOfNames
-	}
-	tmppe.Relocations = nil
-	debugRVA := tmppe.DataDir[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress
-	if debugRVA == 0 {
-		tmppe.DebugDirectory = nil
-	} else {
-		tmppe.DebugDirectory = (*pe.ImageDebugDirectory)(unsafe.Pointer(peRVAtoAddr(tmppe, debugRVA)))
-		if tmppe.DebugDirectory.Type != IMAGE_DEBUG_TYPE_CODEVIEW {
-			tmppe.DebugDirectory = nil
-		} else {
-			tmppe.CodeviewDebugInfo = (*PECodeDebugInfo)(unsafe.Pointer(peRVAtoAddr(tmppe, tmppe.DebugDirectory.AddressOfRawData)))
-			if tmppe.CodeviewDebugInfo.Signature != 1111 {
-				tmppe.DebugDirectory = nil
-				tmppe.CodeviewDebugInfo = nil
-			}
-		}
-	}
-	return tmppe
 }
 
 func getSymbolOffset(symbol *PDBSymbol, symbolName string) uint64 {
@@ -289,134 +192,65 @@ func getSymbolOffset(symbol *PDBSymbol, symbolName string) uint64 {
 	}
 }
 
+func GetFieldOffset(symbol *PDBSymbol, structName string, fieldName string) uint32 {
+	si := &SYMBOL_INFO_PACKAGE{}
+	si.si.SizeOfStruct = uint32(binary.Size(SYMBOL_INFO{}))
+	si.si.MaxNameLen = uint32(binary.Size(si.name))
+	structName16ptr := syscall.StringToUTF16Ptr(structName)
+	res := SymGetTypeFromNameW(unsafe.Pointer(symbol.SymHandle), symbol.PDBBaseAddress, structName16ptr, &si.si)
+	if !res {
+		return 0
+	}
+	childrenParam := &TI_FINDCHILDREN_PARAMS{}
+	TI_GET_CHILDRENCOUNT := int32(13)
+	TI_FINDCHILDREN := int32(7)
+	TI_GET_SYMNAME := int32(1)
+	TI_GET_OFFSET := int32(10)
+	res = SymGetTypeInfo(unsafe.Pointer(symbol.SymHandle), symbol.PDBBaseAddress, si.si.TypeIndex, TI_GET_CHILDRENCOUNT, unsafe.Pointer(&childrenParam.Count))
+	if !res {
+		return 0
+	}
+	cnt := int(childrenParam.Count)
+	allocSize := binary.Size(TI_FINDCHILDREN_PARAMS{}) + (cnt-1)*4
+	// fmt.Printf("TI_FINDCHILDREN_PARAMS_Size: %d, allocSize: %d\n", binary.Size(TI_FINDCHILDREN_PARAMS{}), allocSize)
+	ptr := make([]byte, allocSize)
+	childrenParam = (*TI_FINDCHILDREN_PARAMS)(unsafe.Pointer(&ptr[0]))
+	childrenParam.Count = uint32(cnt)
+	res = SymGetTypeInfo(unsafe.Pointer(symbol.SymHandle), symbol.PDBBaseAddress, si.si.TypeIndex, TI_FINDCHILDREN, unsafe.Pointer(childrenParam))
+	offset := uint32(0)
+	var childIds []uint32
+	for i := 0; i < cnt; i++ {
+		childIds = append(childIds, *(*uint32)(unsafe.Add(unsafe.Pointer(&ptr[0]), 8+i*4)))
+	}
+	for _, chidID := range childIds {
+		var name *uint16
+		SymGetTypeInfo(unsafe.Pointer(symbol.SymHandle), symbol.PDBBaseAddress, chidID, TI_GET_SYMNAME, unsafe.Pointer(&name))
+		tmpName := windows.UTF16PtrToString(name)
+		if !(tmpName == fieldName) {
+			continue
+		}
+		SymGetTypeInfo(unsafe.Pointer(symbol.SymHandle), symbol.PDBBaseAddress, chidID, TI_GET_OFFSET, unsafe.Pointer(&offset))
+		break
+	}
+	return offset
+}
+
 func test() {
 	symbol := loadSymbolsFromImageFile("C:\\windows\\system32\\ntoskrnl.exe")
 	if symbol == nil {
-		panic("test err")
+		panic("symbol err")
 	}
 	fmt.Println(getSymbolOffset(symbol, "PspCreateProcessNotifyRoutine"))
+	fmt.Println(getSymbolOffset(symbol, "PspLoadImageNotifyRoutine"))
+	fmt.Println(getSymbolOffset(symbol, "EtwThreatIntProvRegHandle"))
+	fmt.Println(GetFieldOffset(symbol, "_EPROCESS", "Protection"))
+	fmt.Println(GetFieldOffset(symbol, "_ETW_REG_ENTRY", "GuidEntry"))
+	fmt.Println(GetFieldOffset(symbol, "_ETW_GUID_ENTRY", "ProviderEnableInfo"))
+	fmt.Println(getSymbolOffset(symbol, "PsProcessType"))
+	fmt.Println(getSymbolOffset(symbol, "PsThreadType"))
+	fmt.Println(GetFieldOffset(symbol, "_OBJECT_TYPE", "CallbackList"))
 }
 
 func main() {
-	// _, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	// if err != nil {
-	// 	panic(err)
-	// }
 	test()
 }
-
-// func init_pdb7_root_stream(fName string, root_page_list []uint32, numRootPages uint32, rootSize uint32, pageSize uint32) {
-
-// }
-
-// func pdb7Parse(fn string) {
-// 	// _PDB2_SIGNATURE = b"Microsoft C/C++ program database 2.00\r\n\032JG\0\0"
-// 	// _PDB2_SIGNATURE_LEN = len(_PDB2_SIGNATURE)
-// 	// _PDB2_FMT = "<%dsIHHII" % _PDB2_SIGNATURE_LEN
-// 	_PDB7_SIGNATURE := "Microsoft C/C++ MSF 7.00\r\n\x1ADS\x00\x00\x00"
-// 	_PDB7_SIGNATURE_LEN := len(_PDB7_SIGNATURE)
-// 	readLen := _PDB7_SIGNATURE_LEN + 4 + 4 + 4 + 4 + 4
-// 	f, _ := os.Open(fn)
-// 	b := make([]byte, readLen)
-// 	_, err := f.Read(b)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	signatureSize := _PDB7_SIGNATURE_LEN
-// 	page_size_size := _PDB7_SIGNATURE_LEN + 4
-// 	startPageSize := _PDB7_SIGNATURE_LEN + 4 + 4
-// 	num_file_pages_size := _PDB7_SIGNATURE_LEN + 4 + 4 + 4
-// 	root_size_size := _PDB7_SIGNATURE_LEN + 4 + 4 + 4 + 4
-// 	reserved_size := _PDB7_SIGNATURE_LEN + 4 + 4 + 4 + 4 + 4
-// 	signature := string(b[:signatureSize])
-// 	pageSize := binary.LittleEndian.Uint32(b[signatureSize:page_size_size])          //00 04 00 00 uint32
-// 	startPage := binary.LittleEndian.Uint32(b[page_size_size:startPageSize])         // 03 00 uint32
-// 	numFilePages := binary.LittleEndian.Uint32(b[startPageSize:num_file_pages_size]) // 00 00 uint32
-// 	rootSize := binary.LittleEndian.Uint32(b[num_file_pages_size:root_size_size])    // A3 20 00 00 uint32
-// 	reserved := binary.LittleEndian.Uint32(b[root_size_size:reserved_size])          //B0 92 00 00 uint32
-// 	if signature != _PDB7_SIGNATURE {
-// 		panic("Unsupported file type")
-// 	}
-// 	fmt.Printf("pageSize: %d\n", pageSize)
-// 	fmt.Printf("startPage: %d\n", startPage)
-// 	fmt.Printf("numFilePages: %d\n", numFilePages)
-// 	fmt.Printf("rootSize: %d\n", rootSize)
-// 	fmt.Printf("reserved: %d\n", reserved)
-
-// 	numRootPages := rootSize / pageSize
-// 	if rootSize%pageSize != 0 {
-// 		numRootPages += 1
-// 	}
-// 	fmt.Printf("numRootPages: %d\n", numRootPages)
-
-// 	numRootIndexPages := (numRootPages * 4) / pageSize
-// 	if (numRootPages*4)%pageSize != 0 {
-// 		numRootIndexPages += 1
-// 	}
-// 	fmt.Printf("numRootIndexPages: %d\n", numRootIndexPages)
-
-// 	b = make([]byte, numRootIndexPages*4)
-// 	_, err = f.Read(b)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	fmt.Println(b)
-// 	root_index_pages := make([]uint32, numRootIndexPages*4)
-// 	for i := uint32(0); i < numRootIndexPages; i++ {
-// 		root_index_pages[i] = binary.LittleEndian.Uint32(b[i*4 : (i+1)*4])
-// 	}
-// 	fmt.Println(root_index_pages)
-// 	fmt.Printf("root_index_pages: %d\n", root_index_pages)
-
-// 	root_page_data := make([]byte, 0)
-// 	for _, v := range root_index_pages {
-// 		if v == 0 {
-// 			continue
-// 		}
-// 		f.Seek(int64(v*pageSize), 0)
-// 		tmpbyte := make([]byte, pageSize)
-// 		_, err = f.Read(tmpbyte)
-// 		//fmt.Println(tmpbyte)
-// 		if err != nil {
-// 			panic(err)
-// 		}
-// 		root_page_data = append(root_page_data, tmpbyte...)
-// 	}
-// 	//fmt.Println(root_page_data)
-// 	root_page_list := make([]uint32, numRootPages)
-// 	for i := uint32(0); i < numRootPages; i++ {
-// 		root_page_list[i] = binary.LittleEndian.Uint32(root_page_data[i*4 : (i+1)*4])
-// 	}
-// 	fmt.Print("root_page_list: ")
-// 	fmt.Println(root_page_list)
-// 	init_pdb7_root_stream(fn, root_page_list, numRootPages, rootSize, pageSize)
-// 	// def _pages(length, pagesize):
-// 	// num_pages = length // pagesize
-// 	// if (length % pagesize):
-// 	//     num_pages += 1
-// 	// return num_pages
-// }
-
-// func main2() {
-// 	fn := "C:\\Users\\ZZUF\\github\\pdbdump\\ntkrnlmp.pdb"
-// 	f, _ := os.Open(fn)
-// 	_PDB7_SIGNATURE := "Microsoft C/C++ MSF 7.00\r\n\x1ADS\x00\x00\x00"
-// 	_PDB7_SIGNATURE_LEN := len(_PDB7_SIGNATURE)
-// 	_PDB2_SIGNATURE := "Microsoft C/C++ program database 2.00\r\n\x0032JG\x00\x00"
-// 	_PDB2_SIGNATURE_LEN := len(_PDB2_SIGNATURE)
-// 	b := make([]byte, _PDB7_SIGNATURE_LEN)
-// 	n, _ := f.Read(b)
-// 	if string(b[:n]) == _PDB7_SIGNATURE {
-// 		fmt.Println("TRUE _PDB7_SIGNATURE")
-// 		pdb7Parse(fn)
-// 	} else {
-// 		b = make([]byte, _PDB2_SIGNATURE_LEN)
-// 		f.Seek(0, 0)
-// 		n, _ = f.Read(b)
-// 		if string(b[:n]) == _PDB2_SIGNATURE {
-// 			fmt.Println("TRUE _PDB2_SIGNATURE")
-// 		} else {
-// 			panic("Unsupported file type")
-// 		}
-// 	}
-// }

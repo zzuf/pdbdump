@@ -42,6 +42,7 @@ var (
 
 	procSymCleanup          = modDbghelp.NewProc("SymCleanup")
 	procSymGetTypeFromNameW = modDbghelp.NewProc("SymGetTypeFromNameW")
+	procSymGetTypeInfo      = modDbghelp.NewProc("SymGetTypeInfo")
 	procSymInitialize       = modDbghelp.NewProc("SymInitialize")
 	procSymLoadModuleExW    = modDbghelp.NewProc("SymLoadModuleExW")
 	procSymUnloadModule64   = modDbghelp.NewProc("SymUnloadModule64")
@@ -55,6 +56,12 @@ func SymCleanup(hProcess windows.Handle) (ret bool) {
 
 func SymGetTypeFromNameW(hProcess unsafe.Pointer, BaseOfDll uint64, Name *uint16, Symbol *SYMBOL_INFO) (ret bool) {
 	r0, _, _ := syscall.Syscall6(procSymGetTypeFromNameW.Addr(), 4, uintptr(hProcess), uintptr(BaseOfDll), uintptr(unsafe.Pointer(Name)), uintptr(unsafe.Pointer(Symbol)), 0, 0)
+	ret = r0 != 0
+	return
+}
+
+func SymGetTypeInfo(hProcess unsafe.Pointer, ModBase uint64, TypeId uint32, GetType int32, pInfo unsafe.Pointer) (ret bool) {
+	r0, _, _ := syscall.Syscall6(procSymGetTypeInfo.Addr(), 5, uintptr(hProcess), uintptr(ModBase), uintptr(TypeId), uintptr(GetType), uintptr(pInfo), 0)
 	ret = r0 != 0
 	return
 }
